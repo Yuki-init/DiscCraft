@@ -658,7 +658,6 @@ impl<'a> VideoParser<'a> {
 
     fn set_timestamps(&mut self, start_dts: i64, frame_dur: i64) -> Result<(), EsError> {
         let has_b = self.pictures.iter().any(|p| p.kind == PictureType::B);
-        let delay = if has_b { frame_dur } else { 0 };
 
         let mut acc = start_dts;
         for pic in self.pictures.iter_mut() {
@@ -669,9 +668,7 @@ impl<'a> VideoParser<'a> {
         }
 
         let display = self.display_order()?;
-        let mut acc = start_dts
-            .checked_add(delay)
-            .ok_or_else(|| es_err("pts overflow"))?;
+        let mut acc = start_dts;
         for idx in display {
             if let Some(pic) = self.pictures.get_mut(idx) {
                 pic.pts = acc;
@@ -681,6 +678,27 @@ impl<'a> VideoParser<'a> {
             } else {
                 return Err(es_err("missing picture"));
             }
+        }
+
+        // The reorder delay: one frame with B pictures, or more when repeat_first_field (soft pulldown) makes the
+        // pictures shown ahead of an anchor last longer than it, and never so little that a picture is shown before
+        // it is decoded.
+        let needed = self
+            .pictures
+            .iter()
+            .map(|pic| pic.dts.saturating_sub(pic.pts))
+            .max()
+            .unwrap_or(0);
+        let delay = if has_b {
+            needed.max(frame_dur)
+        } else {
+            needed.max(0)
+        };
+        for pic in self.pictures.iter_mut() {
+            pic.pts = pic
+                .pts
+                .checked_add(delay)
+                .ok_or_else(|| es_err("pts overflow"))?;
         }
 
         for pic in self.pictures.iter() {

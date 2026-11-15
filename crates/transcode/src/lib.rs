@@ -16,6 +16,7 @@
 mod audio;
 pub mod hd;
 mod picture;
+mod pulldown;
 pub mod slideshow;
 mod source;
 mod wav;
