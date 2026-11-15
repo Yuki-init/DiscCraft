@@ -378,7 +378,7 @@ fn mux_input<'a>(loaded: &'a LoadedTitle) -> MuxInput<'a> {
 
     MuxInput {
         video: &loaded.video,
-        video_data: &loaded.video_data,
+        video_data: &*loaded.video_data,
         audio,
         audio_start_pts: loaded.first_pts,
         cell_starts: loaded.cell_starts.clone(),

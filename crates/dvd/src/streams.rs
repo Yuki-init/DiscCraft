@@ -91,15 +91,49 @@ pub fn load_title_streams(
     cache_dir: &Path,
     progress: &mut dyn FnMut(&str, f32),
 ) -> Result<Vec<TitleStreams>, DvdError> {
+    load_titles(project, cache_dir, progress, true)
+}
+
+/// [`load_title_streams`] for a Blu-ray in HD, which encodes the timelines' video on its own: the timelines come
+/// with their sound, chapters and timing but no video (and no SD subtitles), so their MPEG-2 is never made.
+///
+/// # Errors
+///
+/// As [`load_title_streams`].
+pub fn load_title_streams_for_hd(
+    project: &Project,
+    cache_dir: &Path,
+    progress: &mut dyn FnMut(&str, f32),
+) -> Result<Vec<TitleStreams>, DvdError> {
+    load_titles(project, cache_dir, progress, false)
+}
+
+fn load_titles(
+    project: &Project,
+    cache_dir: &Path,
+    progress: &mut dyn FnMut(&str, f32),
+    timeline_video: bool,
+) -> Result<Vec<TitleStreams>, DvdError> {
     let budget = prepare::budget(project)?;
     // Transcode the titles in parallel first; the titles below then come from the cache.
-    prepare::prepare_all(project, cache_dir, &budget, progress)?;
+    prepare::prepare_all_of(project, cache_dir, &budget, progress, timeline_video)?;
     let mut titles = Vec::new();
+    let standard = project.settings.standard;
     for timeline in project.timelines.values() {
-        let prepared = prepare::prepare_title(project, timeline, cache_dir, &budget, progress)?;
-        let loaded = source::load_title(project, timeline, project.settings.standard, &prepared)?;
-        let mut title = convert(TitleSource::Timeline(timeline.id.0), loaded);
-        title.subtitles = subtitle_tracks(project, timeline, title.first_pts)?;
+        let source = TitleSource::Timeline(timeline.id.0);
+        let title = if timeline_video {
+            let prepared = prepare::prepare_title(project, timeline, cache_dir, &budget, progress)?;
+            let loaded = source::load_title(project, timeline, standard, &prepared)?;
+            let mut title = convert(source, loaded)?;
+            title.subtitles = subtitle_tracks(project, timeline, title.first_pts)?;
+            title
+        } else {
+            let prepared = prepare::prepare_title_sound(project, timeline, cache_dir)?;
+            convert(
+                source,
+                source::load_title_without_video(project, timeline, standard, &prepared)?,
+            )?
+        };
         titles.push(title);
     }
     for id in slideshow_ids(project) {
@@ -111,22 +145,27 @@ pub fn load_title_streams(
             prepare::prepare_slideshow(project, slideshow, cache_dir, &budget, progress)?;
         let loaded =
             load_slideshow_title(project, slideshow, project.settings.standard, &prepared)?;
-        titles.push(convert(TitleSource::Slideshow(id), loaded));
+        titles.push(convert(TitleSource::Slideshow(id), loaded)?);
     }
     Ok(titles)
 }
 
-fn convert(source: TitleSource, loaded: LoadedTitle) -> TitleStreams {
-    TitleStreams {
+/// A loaded title as the Blu-ray build takes it: its SD video (none for an HD title's) read into memory.
+fn convert(source: TitleSource, loaded: LoadedTitle) -> Result<TitleStreams, DvdError> {
+    let video_data = loaded
+        .video_data
+        .bytes(0..loaded.video_data.len())
+        .map_err(|err| DvdError::Invalid(format!("video read error: {err}")))?;
+    Ok(TitleStreams {
         source,
         video: loaded.video,
-        video_data: loaded.video_data,
+        video_data,
         audio: loaded.audio.into_iter().map(convert_audio).collect(),
         chapter_starts: loaded.cell_starts,
         first_pts: loaded.first_pts,
         wide: loaded.wide,
         subtitles: Vec::new(),
-    }
+    })
 }
 
 /// Parse and render every subtitle track of a timeline; cue times become 27 MHz presentation times.

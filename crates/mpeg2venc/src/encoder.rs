@@ -105,11 +105,19 @@ const VBV_MARGIN: f64 = 0.1;
 impl RateControl {
     /// The quantiser_scale_code (2–31) for the next picture of `picture_type`, aiming at its share of the budget
     /// and leaving the VBV margin free of the `available` bits. `codes` are the last I and P pictures' codes.
-    fn code(&self, picture_type: PictureType, budget: Budget, available: u64, codes: (u8, u8)) -> u8 {
+    fn code(
+        &self,
+        picture_type: PictureType,
+        budget: Budget,
+        available: u64,
+        codes: (u8, u8),
+    ) -> u8 {
         let Some(complexity_i) = self.complexity_i else {
             return FIRST_CODE;
         };
-        let complexity_p = self.complexity_p.unwrap_or(complexity_i * P_TO_I_COMPLEXITY);
+        let complexity_p = self
+            .complexity_p
+            .unwrap_or(complexity_i * P_TO_I_COMPLEXITY);
         // Shares in which a P picture's code comes out P_TO_I_CODE times the I picture's.
         let (weight_i, weight_p) = (complexity_i, complexity_p / P_TO_I_CODE);
         let total = weight_i + (budget.gop_frames - 1.0).max(0.0) * weight_p;
@@ -1185,7 +1193,12 @@ fn write_non_intra_block(writer: &mut BitWriter, levels: &[i16; 64]) {
 }
 
 /// Writes the nonzero levels from scan position `from` on as run/level codes of `table`, then end of block.
-fn write_coefficients(writer: &mut BitWriter, levels: &[i16; 64], from: usize, table: vlc::DctTable) {
+fn write_coefficients(
+    writer: &mut BitWriter,
+    levels: &[i16; 64],
+    from: usize,
+    table: vlc::DctTable,
+) {
     let mut run = 0u8;
     let mut first = true;
 

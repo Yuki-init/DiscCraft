@@ -79,7 +79,10 @@ fn soft_pulldown_lasts_its_fields_and_shows_each_frame_when_its_fields_do() {
 
     // 24 frames of 2.5 fields on average: 60 fields, 30 frame periods.
     let seconds = disccraft_transcode::probe_seconds(&path).unwrap();
-    assert!((seconds - 30.0 * 1001.0 / 30000.0).abs() < 1e-6, "{seconds} s");
+    assert!(
+        (seconds - 30.0 * 1001.0 / 30000.0).abs() < 1e-6,
+        "{seconds} s"
+    );
 
     // Frame k (k even) starts after 5k/2 fields; sample the middle of each frame's showing.
     let field = 1001.0 / 60000.0;

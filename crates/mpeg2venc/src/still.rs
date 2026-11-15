@@ -468,7 +468,13 @@ fn write_ac(writer: &mut BitWriter, coeffs: &[f64; 64], quantiser_scale: f64) {
         if let Some(&(u, v)) = ZIGZAG.get(index) {
             let level = ac_level(coeffs, u, v, quantiser_scale);
             if level != 0 {
-                crate::vlc::write_coefficient(writer, crate::vlc::DctTable::Zero, run, level, false);
+                crate::vlc::write_coefficient(
+                    writer,
+                    crate::vlc::DctTable::Zero,
+                    run,
+                    level,
+                    false,
+                );
                 run = 0;
             } else {
                 run = run.saturating_add(1);

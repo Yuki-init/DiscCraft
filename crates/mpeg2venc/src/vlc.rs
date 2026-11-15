@@ -834,10 +834,16 @@ mod tests {
             // (The sign bit after a run/level code splits its share of the code space, not adds to it.) Table zero
             // leaves only "0000 0000 0000 xxxx" unused: a Kraft sum of 1 - 2^-12. Table one also leaves free the
             // codes its short ones replaced.
-            let kraft: f64 = codes.iter().map(|&(_, len)| 2f64.powi(-i32::from(len))).sum();
+            let kraft: f64 = codes
+                .iter()
+                .map(|&(_, len)| 2f64.powi(-i32::from(len)))
+                .sum();
             assert!(kraft <= 1.0, "{table:?}: Kraft sum {kraft}");
             if table == DctTable::Zero {
-                assert!((kraft - (1.0 - 2f64.powi(-12))).abs() < 1e-12, "Kraft sum {kraft}");
+                assert!(
+                    (kraft - (1.0 - 2f64.powi(-12))).abs() < 1e-12,
+                    "Kraft sum {kraft}"
+                );
             }
         }
     }
@@ -862,8 +868,14 @@ mod tests {
         assert_eq!(coefficient(DctTable::One, 0, 2, false), vec![0xC0]);
         assert_eq!(coefficient(DctTable::One, 0, 1, true), vec![0x80]);
         // Not in the tables (run 0 level 41, run 32 level 1): escape.
-        assert_eq!(coefficient(DctTable::Zero, 0, 41, false), write_escape(0, 41));
-        assert_eq!(coefficient(DctTable::One, 32, 1, false), write_escape(32, 1));
+        assert_eq!(
+            coefficient(DctTable::Zero, 0, 41, false),
+            write_escape(0, 41)
+        );
+        assert_eq!(
+            coefficient(DctTable::One, 32, 1, false),
+            write_escape(32, 1)
+        );
     }
 
     #[test]

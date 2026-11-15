@@ -99,6 +99,8 @@ fn field_tick(rate: FrameRate, field: i64) -> Tick {
 pub(crate) struct Picture {
     /// A GOP header came before it (since the previous picture).
     pub(crate) gop: bool,
+    /// That GOP header's closed_gop flag.
+    pub(crate) closed: bool,
     pub(crate) temporal_reference: u16,
     pub(crate) intra: bool,
     /// Fields it is shown for: 2, or 3 with repeat_first_field.
@@ -123,21 +125,92 @@ pub(crate) fn presented_fields(pictures: &[Picture]) -> Vec<u32> {
             if picture.gop || index == 0 {
                 base = index;
             }
-            (base + i64::from(picture.temporal_reference), index as usize, picture.fields)
+            (
+                base + i64::from(picture.temporal_reference),
+                index as usize,
+                picture.fields,
+            )
         })
         .collect();
     let Some(&(first_key, _, _)) = keyed.first() else {
         return Vec::new();
     };
-    let mut shown: Vec<&(i64, usize, u32)> = keyed.iter().filter(|(key, _, _)| *key >= first_key).collect();
+    let mut shown: Vec<&(i64, usize, u32)> = keyed
+        .iter()
+        .filter(|(key, _, _)| *key >= first_key)
+        .collect();
     shown.sort_by_key(|(key, index, _)| (*key, *index));
     shown.into_iter().map(|(_, _, fields)| *fields).collect()
+}
+
+/// The start of each GOP of an elementary stream: when its first picture is shown, from the stream's first shown
+/// picture (every picture counted, as a DVD multiplexer times them), and whether it is closed. `rate` is the coded
+/// frame rate.
+pub(crate) fn gop_starts(pictures: &[Picture], rate: FrameRate) -> Vec<(Tick, bool)> {
+    // Each picture's GOP (from 0) and display key: the decode index of its GOP's first picture plus its
+    // temporal_reference.
+    let mut closed = Vec::new();
+    let mut base = 0i64;
+    let mut keyed: Vec<(i64, usize, usize, u32)> = Vec::with_capacity(pictures.len());
+    for (index, picture) in pictures.iter().enumerate() {
+        if picture.gop || index == 0 {
+            closed.push(picture.closed);
+            base = index as i64;
+        }
+        let key = base + i64::from(picture.temporal_reference);
+        keyed.push((key, index, closed.len().saturating_sub(1), picture.fields));
+    }
+    keyed.sort_by_key(|&(key, index, _, _)| (key, index));
+
+    let mut starts: Vec<Option<Tick>> = vec![None; closed.len()];
+    let mut fields = 0i64;
+    for &(_, _, gop, count) in &keyed {
+        let time = field_tick(rate, fields);
+        if let Some(slot) = starts.get_mut(gop)
+            && slot.is_none_or(|start| time < start)
+        {
+            *slot = Some(time);
+        }
+        fields += i64::from(count);
+    }
+    starts
+        .into_iter()
+        .zip(closed)
+        .filter_map(|(start, closed)| start.map(|start| (start, closed)))
+        .collect()
+}
+
+/// The frame rate of a sequence header's frame_rate_code.
+pub(crate) fn frame_rate_of_code(code: u8) -> Option<FrameRate> {
+    let (num, den) = match code {
+        1 => (24000, 1001),
+        2 => (24, 1),
+        3 => (25, 1),
+        4 => (30000, 1001),
+        5 => (30, 1),
+        6 => (50, 1),
+        7 => (60000, 1001),
+        8 => (60, 1),
+        _ => return None,
+    };
+    Some(FrameRate { num, den })
+}
+
+/// The pictures of an elementary stream and its sequence header's frame_rate_code.
+pub(crate) struct Scanned {
+    pub(crate) pictures: Vec<Picture>,
+    pub(crate) frame_rate_code: u8,
 }
 
 /// Reads the pictures of an MPEG-2 video elementary stream (it starts with a sequence header) without decoding it.
 /// `None` when it is not one, codes field pictures, or is a progressive sequence (whose repeat flags repeat frames,
 /// not fields): those are left to FilmCraft.
 pub(crate) fn scan_elementary_stream(path: &Path) -> std::io::Result<Option<Vec<Picture>>> {
+    Ok(scan(path)?.map(|scanned| scanned.pictures))
+}
+
+/// [`scan_elementary_stream`], with the frame rate code.
+pub(crate) fn scan(path: &Path) -> std::io::Result<Option<Scanned>> {
     let mut file = std::io::BufReader::with_capacity(1 << 20, std::fs::File::open(path)?);
     let mut scanner = Scanner::default();
     let mut window: Vec<u8> = Vec::new();
@@ -158,7 +231,10 @@ pub(crate) fn scan_elementary_stream(path: &Path) -> std::io::Result<Option<Vec<
             break;
         }
     }
-    Ok(scanner.started.then_some(scanner.pictures))
+    Ok(scanner.started.then_some(Scanned {
+        pictures: scanner.pictures,
+        frame_rate_code: scanner.frame_rate_code,
+    }))
 }
 
 /// The bytes after a start code the scanner reads.
@@ -167,8 +243,10 @@ const HEADER_BYTES: usize = 4;
 #[derive(Default)]
 struct Scanner {
     started: bool,
-    gop: bool,
+    /// The closed_gop flag of a GOP header not yet followed by its first picture.
+    gop: Option<bool>,
     unsupported: bool,
+    frame_rate_code: u8,
     pictures: Vec<Picture>,
 }
 
@@ -192,13 +270,19 @@ impl Scanner {
     fn start_code(&mut self, code: u8, payload: &[u8]) {
         let byte = |index: usize| payload.get(index).copied().unwrap_or(0);
         match code {
-            0xB3 => self.started = true,
-            0xB8 => self.gop = true,
+            0xB3 => {
+                self.started = true;
+                self.frame_rate_code = byte(3) & 0x0F;
+            }
+            // GOP header: time code (25 bits), then closed_gop.
+            0xB8 => self.gop = Some(byte(3) & 0x40 != 0),
             0x00 if self.started => {
                 let temporal_reference = (u16::from(byte(0)) << 2) | u16::from(byte(1) >> 6);
                 let coding_type = (byte(1) >> 3) & 7;
+                let gop = self.gop.take();
                 self.pictures.push(Picture {
-                    gop: std::mem::take(&mut self.gop),
+                    gop: gop.is_some(),
+                    closed: gop.unwrap_or(false),
                     temporal_reference,
                     intra: coding_type == 1,
                     fields: 2,
@@ -237,6 +321,7 @@ mod tests {
     fn picture(gop: bool, temporal_reference: u16, intra: bool, fields: u32) -> Picture {
         Picture {
             gop,
+            closed: false,
             temporal_reference,
             intra,
             fields,
@@ -246,7 +331,9 @@ mod tests {
     #[test]
     fn soft_pulldown_lasts_five_fourths_longer() {
         // 2:3 pulldown: 24 film frames are 60 fields, one second at 29.97.
-        let fields: Vec<u32> = (0..24).map(|index| if index % 2 == 0 { 2 } else { 3 }).collect();
+        let fields: Vec<u32> = (0..24)
+            .map(|index| if index % 2 == 0 { 2 } else { 3 })
+            .collect();
         let timeline = Timeline::from_fields(&fields, NTSC).unwrap();
         assert_eq!(timeline.duration(), NTSC.tick_of(30));
         assert!(timeline.is_uneven(NTSC));
@@ -267,13 +354,36 @@ mod tests {
     #[test]
     fn timestamps_give_the_timeline() {
         // 23.976 frames: 3753.75 ticks of 90 kHz apart, as 3754 / 3753.
-        let pts: Vec<Option<i64>> = (0..48).map(|index| Some(1000 + index * 90_090 / 24)).collect();
+        let pts: Vec<Option<i64>> = (0..48)
+            .map(|index| Some(1000 + index * 90_090 / 24))
+            .collect();
         let timeline = Timeline::from_pts(&pts).unwrap();
         assert!(timeline.is_uneven(NTSC));
         let seconds = timeline.duration().0 as f64 / crate::TICKS_PER_SECOND as f64;
         assert!((seconds - 2.002).abs() < 0.001, "{seconds}");
         assert_eq!(Timeline::from_pts(&[Some(0), None, Some(6000)]), None);
         assert_eq!(Timeline::from_pts(&[Some(0), Some(0)]), None);
+    }
+
+    #[test]
+    fn gops_start_at_their_first_shown_picture() {
+        // Closed GOP I P (2 + 3 fields), then an open GOP I B B whose leading B pictures are shown first, 2 fields
+        // each.
+        let mut first = picture(true, 0, true, 2);
+        first.closed = true;
+        let pictures = [
+            first,
+            picture(false, 1, false, 3),
+            picture(true, 2, true, 2),
+            picture(false, 0, false, 2),
+            picture(false, 1, false, 2),
+        ];
+        let starts = super::gop_starts(&pictures, NTSC);
+        // The open GOP starts with its first B picture, after 5 fields.
+        assert_eq!(
+            starts,
+            vec![(Tick(0), true), (super::field_tick(NTSC, 5), false)]
+        );
     }
 
     #[test]
