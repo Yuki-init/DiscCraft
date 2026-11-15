@@ -58,6 +58,9 @@ pub struct SubtitleTrack {
     pub language: Option<[u8; 2]>,
     /// Cues in time order.
     pub cues: Vec<SubtitleCue>,
+    /// A PGS (`.sup`) track's own segments, passed through (times 90 kHz on the title's clock, as `first_pts`);
+    /// empty for drawn cues.
+    pub segments: Vec<crate::PgSegment>,
 }
 
 /// Elementary streams of one title, in the DVD-compatible encoding (MPEG-2 video, LPCM / AC-3 audio).
@@ -199,7 +202,35 @@ pub fn subtitle_tracks_sized(
             .assets
             .get(&track.asset)
             .ok_or_else(|| DvdError::Invalid("subtitle asset does not exist".to_string()))?;
-        let cues = read_subtitles(Path::new(&asset.path), &project.settings)
+        let path = Path::new(&asset.path);
+        match source::subtitle_file(path) {
+            source::SubtitleFile::Text => {}
+            source::SubtitleFile::Pgs => {
+                // A Blu-ray's own subtitles: their segments as they are, moved onto the title's clock.
+                let start = first_pts / 300;
+                let segments = crate::sup::read_sup(path)?
+                    .into_iter()
+                    .map(|segment| crate::PgSegment {
+                        pts: start + segment.pts,
+                        dts: start + segment.dts,
+                        data: segment.data,
+                    })
+                    .collect();
+                tracks.push(SubtitleTrack {
+                    language: source::parse_language(&track.language),
+                    cues: Vec::new(),
+                    segments,
+                });
+                continue;
+            }
+            source::SubtitleFile::VobSub => {
+                return Err(DvdError::Unsupported(format!(
+                    "{}: VobSub (.idx/.sub) subtitles are a DVD's; a Blu-ray takes PGS (.sup) or text subtitles",
+                    path.display()
+                )));
+            }
+        }
+        let cues = read_subtitles(path, &project.settings)
             .map_err(|e| DvdError::Invalid(e.to_string()))?;
         let mut rendered = Vec::with_capacity(cues.len());
         for cue in cues {
@@ -214,6 +245,7 @@ pub fn subtitle_tracks_sized(
         tracks.push(SubtitleTrack {
             language: source::parse_language(&track.language),
             cues: rendered,
+            segments: Vec::new(),
         });
     }
     Ok(tracks)

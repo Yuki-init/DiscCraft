@@ -36,6 +36,8 @@ pub(crate) struct LoadedTitle {
     /// One list of subpicture units per subtitle track, and the tracks' languages.
     pub(crate) subpictures: Vec<Vec<SubpictureUnit>>,
     pub(crate) subtitle_languages: Vec<Option<[u8; 2]>>,
+    /// The title's palette (`00 Y Cr Cb`): the colours its subtitles draw with.
+    pub(crate) palette: [u32; 16],
     /// Still time of every cell (`0xFF` holds each slide of a manual-advance slideshow until the viewer goes on).
     pub(crate) cell_still: u8,
 }
@@ -91,7 +93,7 @@ pub(crate) fn load_title(
         with_layer_break(&chapter_starts, layer_break, standard)?;
     let disc_language = audio_language(project);
     let mut audio = load_audio(timeline, first_pts, &prepared.audio_tracks, disc_language)?;
-    let (subpictures, subtitle_languages) = load_subtitles(project, timeline, first_pts, standard)?;
+    let subtitles = load_subtitles(project, timeline, first_pts, standard)?;
 
     // A transcoded asset brings its own soundtrack (AC-3) when the timeline has no explicit audio tracks.
     if audio.is_empty()
@@ -114,8 +116,9 @@ pub(crate) fn load_title(
         first_pts,
         ntsc: standard == VideoStandard::Ntsc,
         wide: timeline.wide(&project.settings),
-        subpictures,
-        subtitle_languages,
+        subpictures: subtitles.streams,
+        subtitle_languages: subtitles.languages,
+        palette: subtitles.palette,
         cell_still: 0,
     })
 }
@@ -168,17 +171,50 @@ pub(crate) fn load_title_without_video(
         wide: timeline.wide(&project.settings),
         subpictures: Vec::new(),
         subtitle_languages: Vec::new(),
+        palette: text_palette(),
         cell_still: 0,
     })
 }
 
-/// Load every SRT subtitle track of the timeline as DVD subpicture units (white text, black outline).
+/// A title's subtitle streams (its subpicture units), their languages and the palette they draw with.
+pub(crate) struct TitleSubtitles {
+    pub(crate) streams: Vec<Vec<SubpictureUnit>>,
+    pub(crate) languages: Vec<Option<[u8; 2]>>,
+    pub(crate) palette: [u32; 16],
+}
+
+/// The kind of a subtitle file, by its extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubtitleFile {
+    /// SRT, WebVTT or a timecoded text script: drawn.
+    Text,
+    /// VobSub (`.idx` + `.sub`): a DVD's subpictures, passed through.
+    VobSub,
+    /// PGS (`.sup`): a Blu-ray's subtitles, passed through.
+    Pgs,
+}
+
+pub(crate) fn subtitle_file(path: &Path) -> SubtitleFile {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("idx") => SubtitleFile::VobSub,
+        Some("sup") => SubtitleFile::Pgs,
+        _ => SubtitleFile::Text,
+    }
+}
+
+/// Load every subtitle track of the timeline as DVD subpicture units: text drawn (white text, black outline), a
+/// VobSub's units as they are with their colours moved into the title's palette.
 fn load_subtitles(
     project: &Project,
     timeline: &Timeline,
     first_pts: i64,
     standard: VideoStandard,
-) -> Result<(Vec<Vec<SubpictureUnit>>, Vec<Option<[u8; 2]>>), DvdError> {
+) -> Result<TitleSubtitles, DvdError> {
     if timeline.subtitles.len() > 32 {
         return Err(DvdError::Invalid(
             "a DVD title holds at most 32 subtitle tracks".to_string(),
@@ -189,24 +225,60 @@ fn load_subtitles(
     } else {
         576
     };
+    let paths: Vec<&Path> = timeline
+        .subtitles
+        .iter()
+        .map(|track| {
+            project
+                .assets
+                .get(&track.asset)
+                .map(|asset| Path::new(asset.path.as_str()))
+                .ok_or_else(|| DvdError::Invalid("subtitle asset does not exist".to_string()))
+        })
+        .collect::<Result<_, _>>()?;
+    let any_text = paths
+        .iter()
+        .any(|path| subtitle_file(path) == SubtitleFile::Text);
+    let mut palette = crate::vobsub::PaletteBuilder::new(any_text);
     let mut streams = Vec::new();
     let mut languages = Vec::new();
-    for track in &timeline.subtitles {
-        let asset = project
-            .assets
-            .get(&track.asset)
-            .ok_or_else(|| DvdError::Invalid("subtitle asset does not exist".to_string()))?;
-        // SRT, WebVTT or a timecoded text script, in UTF-8 / UTF-16 / Shift_JIS.
-        let cues = read_subtitles(Path::new(&asset.path), &project.settings)
-            .map_err(|e| DvdError::Invalid(e.to_string()))?;
-        let mut units = Vec::with_capacity(cues.len());
-        for cue in cues {
-            units.push(subtitle_unit(&cue, first_pts, height)?);
-        }
+    for (track, path) in timeline.subtitles.iter().zip(paths) {
+        let (units, file_language) = match subtitle_file(path) {
+            SubtitleFile::Text => {
+                // SRT, WebVTT or a timecoded text script, in UTF-8 / UTF-16 / Shift_JIS.
+                let cues = read_subtitles(path, &project.settings)
+                    .map_err(|e| DvdError::Invalid(e.to_string()))?;
+                let units = cues
+                    .iter()
+                    .map(|cue| subtitle_unit(cue, first_pts, height))
+                    .collect::<Result<Vec<_>, _>>()?;
+                (units, None)
+            }
+            SubtitleFile::VobSub => {
+                let vobsub = crate::vobsub::read_vobsub(path)?;
+                let mut units = Vec::with_capacity(vobsub.units.len());
+                for (ms, mut spu) in vobsub.units {
+                    palette.remap(&mut spu, &vobsub.palette)?;
+                    let pts = first_pts.saturating_add(ms.saturating_mul(27_000));
+                    units.push(SubpictureUnit { pts, data: spu });
+                }
+                (units, vobsub.language)
+            }
+            SubtitleFile::Pgs => {
+                return Err(DvdError::Unsupported(format!(
+                    "{}: PGS (.sup) subtitles are a Blu-ray's; a DVD takes VobSub (.idx/.sub) or text subtitles",
+                    path.display()
+                )));
+            }
+        };
         streams.push(units);
-        languages.push(parse_language(&track.language));
+        languages.push(parse_language(&track.language).or(file_language));
     }
-    Ok((streams, languages))
+    Ok(TitleSubtitles {
+        streams,
+        languages,
+        palette: palette.palette(),
+    })
 }
 
 fn subtitle_unit(cue: &Cue, first_pts: i64, height: u16) -> Result<SubpictureUnit, DvdError> {
@@ -567,6 +639,11 @@ fn validate_lpcm(stream: &LpcmStream) -> Result<(), DvdError> {
     }
 
     Ok(())
+}
+
+/// The palette of a title whose subtitles are all drawn text (and of one without subtitles).
+pub(crate) fn text_palette() -> [u32; 16] {
+    crate::vobsub::PaletteBuilder::new(true).palette()
 }
 
 #[cfg(test)]

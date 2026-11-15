@@ -227,6 +227,24 @@ fn pg_inputs(
 
 /// Subtitle bitmaps → PGS display sets. Palette: 0 transparent, 1 white text, 2 black outline.
 fn pg_units(track: &SubtitleTrack, width: u16, height: u16) -> Result<Vec<EsUnit>, BdError> {
+    // A PGS file's own segments, as they are (one PES each).
+    if !track.segments.is_empty() {
+        return track
+            .segments
+            .iter()
+            .map(|segment| {
+                let time = |value: i64| {
+                    u64::try_from(value).map_err(|_| invalid("subtitle before the title starts"))
+                };
+                Ok(EsUnit {
+                    pts: time(segment.pts)?,
+                    dts: time(segment.dts)?,
+                    data: segment.data.clone(),
+                    random_access: false,
+                })
+            })
+            .collect();
+    }
     let palette = vec![
         disccraft_pgs::rgba_to_entry(0, 0, 0, 0, 0),
         disccraft_pgs::rgba_to_entry(1, 255, 255, 255, 255),

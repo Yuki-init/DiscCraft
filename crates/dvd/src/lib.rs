@@ -16,8 +16,11 @@ mod demux;
 mod output;
 mod prepare;
 mod preview;
+mod sup;
+mod vobsub;
 pub use demux::demux_h264_for_bd;
 pub use prepare::{Estimate, TranscodeStatus, encode_hd_slideshow, estimate, transcode_status};
+pub use sup::PgSegment;
 
 pub use preview::preview_model;
 mod source;
@@ -637,6 +640,7 @@ pub(crate) fn load_slideshow_title(
         wide: project.settings.widescreen,
         subpictures: Vec::new(),
         subtitle_languages: Vec::new(),
+        palette: source::text_palette(),
         // 手動で進める: 各スライドのセルを無限の静止にして、リモコンの次へ / 決定で進む。
         cell_still: if slideshow.manual_advance { 0xFF } else { 0 },
     })
